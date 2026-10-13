@@ -1,0 +1,12 @@
+services:
+  faucet:
+    build: .
+    user: "${CONTAINER_UID:-10001}:${CONTAINER_GID:-10001}"
+    restart: unless-stopped
+    stop_grace_period: 10m
+    env_file: .env
+    environment:
+      DATABASE_PATH: /data/faucet.sqlite
+      WALLET_DATA_DIR: /data/wallet
+    volumes:
+      - ./data:/data
