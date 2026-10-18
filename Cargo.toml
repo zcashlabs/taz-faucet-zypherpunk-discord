@@ -11,14 +11,21 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 dotenvy = "0.15"
 fs2 = "0.4"
 http = "1"
+lightwallet-protocol = "0.4"
+nonempty = "0.11"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "native_tls_backend"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zingolib = { git = "https://github.com/zingolabs/zingolib.git", rev = "62d42596eec0951ac14daa0e712318263c5e8820", package = "zingolib" }
 zcash_client_backend = { version = "=0.25.0-pre.1", features = ["orchard", "transparent-inputs"] }
 zip32 = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+zcash_keys = "=0.17.0-pre.1"
 
 [profile.release]
 lto = true

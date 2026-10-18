@@ -14,7 +14,7 @@ pub struct InsufficientFunds;
 impl std::fmt::Display for InsufficientFunds {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(
-            "faucet wallet does not have the payout plus the fee reserve in confirmed shielded funds",
+            "faucet wallet does not have the payout plus the fee reserve in spendable shielded funds",
         )
     }
 }
@@ -60,25 +60,15 @@ async fn check_wallet(client: &mut LightClient, amount_zatoshis: i64) -> Result<
         .fully_scanned_height()
         .map(u64::from)
         .context("light wallet has no fully scanned chain height")?;
-    drop(wallet);
     anyhow::ensure!(
         scanned_height.saturating_add(MAX_WALLET_LAG) >= info.latest_block_height,
         "light wallet is more than 100 blocks behind lightwalletd"
     );
 
-    let balance = client
-        .account_balance(zip32::AccountId::ZERO)
-        .await
-        .context("could not read faucet wallet balance")?;
-    let spendable_zatoshis = [
-        balance.confirmed_ironwood_balance,
-        balance.confirmed_orchard_balance,
-        balance.confirmed_sapling_balance,
-    ]
-    .into_iter()
-    .flatten()
-    .map(|value| value.into_u64())
-    .fold(0_u64, u64::saturating_add);
+    let spendable_zatoshis = wallet
+        .shielded_spendable_balance(zip32::AccountId::ZERO, false)
+        .context("could not read faucet wallet spendable balance")?
+        .into_u64();
     let required = u64::try_from(amount_zatoshis)
         .context("configured payout amount is outside the supported range")?
         .saturating_add(MINIMUM_FEE_RESERVE_ZATOSHIS);

@@ -8,12 +8,16 @@ use serenity::{
     all::{
         CommandOptionType, CreateAllowedMentions, CreateCommand, CreateCommandOption,
         CreateInteractionResponse, CreateInteractionResponseMessage, EditInteractionResponse,
-        GatewayIntents, Interaction, Ready,
+        GatewayIntents, Guild, Interaction, Ready,
     },
     async_trait,
     prelude::*,
 };
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 const MAX_ADDRESS_LENGTH: usize = 512;
@@ -21,25 +25,21 @@ const MAX_ADDRESS_LENGTH: usize = 512;
 struct Handler {
     guild_id: u64,
     channel_id: u64,
-    payout: PayoutService,
+    payout: Arc<PayoutService>,
+    shutdown: CancellationToken,
+    registering: AtomicBool,
 }
 
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!(bot = %ready.user.name, "Discord bot connected");
-        let guild = serenity::all::GuildId::new(self.guild_id);
-        let mut attempt = 0_u32;
-        loop {
-            match guild.set_commands(&ctx.http, vec![drip_command()]).await {
-                Ok(_) => return,
-                Err(err) => {
-                    attempt = attempt.saturating_add(1);
-                    let backoff = 1_u64 << attempt.saturating_sub(1).min(5);
-                    warn!(%err, attempt, backoff, "Discord command registration failed; retrying");
-                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                }
-            }
+        self.register_commands(&ctx).await;
+    }
+
+    async fn guild_create(&self, ctx: Context, guild: Guild, _is_new: Option<bool>) {
+        if guild.id.get() == self.guild_id {
+            self.register_commands(&ctx).await;
         }
     }
 
@@ -72,7 +72,7 @@ impl EventHandler for Handler {
             respond_ephemeral(&command, &ctx, "Provide a Zcash testnet address.").await;
             return;
         };
-        if !valid_address_input(address) {
+        let Some(address) = parse_testnet_address(address) else {
             respond_ephemeral(
                 &command,
                 &ctx,
@@ -80,7 +80,7 @@ impl EventHandler for Handler {
             )
             .await;
             return;
-        }
+        };
         if let Err(err) = command
             .create_response(
                 &ctx.http,
@@ -97,7 +97,7 @@ impl EventHandler for Handler {
             return;
         }
 
-        let reply = match self.payout.claim(command.user.id.get(), address).await {
+        let reply = match self.payout.claim(command.user.id.get(), &address).await {
             Ok(result) => claim_response(result),
             Err(err) => {
                 error!(%err, "could not process faucet claim");
@@ -108,14 +108,54 @@ impl EventHandler for Handler {
     }
 }
 
-fn valid_address_input(address: &str) -> bool {
-    address.len() <= MAX_ADDRESS_LENGTH
-        && zingolib::utils::conversion::address_from_str(address).is_ok()
-        && ["utest1", "ztestsapling", "tm", "t2"].iter().any(|prefix| {
-            address
-                .get(..prefix.len())
-                .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
-        })
+impl Handler {
+    async fn register_commands(&self, ctx: &Context) {
+        if self.registering.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let guild = serenity::all::GuildId::new(self.guild_id);
+        for attempt in 0..6 {
+            let result = tokio::select! {
+                _ = self.shutdown.cancelled() => break,
+                result = guild.set_commands(&ctx.http, vec![drip_command()]) => result,
+            };
+            match result {
+                Ok(_) => {
+                    info!(guild_id = self.guild_id, "Discord /drip command registered");
+                    break;
+                }
+                Err(err) => {
+                    let permanent = matches!(&err, serenity::Error::Http(error)
+                        if error.status_code().is_some_and(|status|
+                            status.is_client_error() && status.as_u16() != 429));
+                    if permanent || attempt == 5 {
+                        error!(%err, guild_id = self.guild_id, "Discord command registration stopped; check bot installation and server access, then restart");
+                        break;
+                    }
+                    let backoff = 1_u64 << attempt;
+                    warn!(%err, backoff, "Discord command registration failed; retrying");
+                    tokio::select! {
+                        _ = self.shutdown.cancelled() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff)) => {}
+                    }
+                }
+            }
+        }
+        self.registering.store(false, Ordering::Release);
+    }
+}
+
+fn parse_testnet_address(address: &str) -> Option<String> {
+    if address.len() > MAX_ADDRESS_LENGTH {
+        return None;
+    }
+    let encoded = zingolib::utils::conversion::address_from_str(address)
+        .ok()?
+        .to_string();
+    ["utest1", "ztestsapling", "tm", "t2"]
+        .iter()
+        .any(|prefix| encoded.starts_with(prefix))
+        .then_some(encoded)
 }
 
 fn claim_response(result: ClaimResult) -> String {
@@ -125,7 +165,7 @@ fn claim_response(result: ClaimResult) -> String {
                 .to_owned()
         }
         ClaimResult::Paused => "The faucet is temporarily paused.".to_owned(),
-        ClaimResult::NeedsReconciliation => "Your previous payout has an unclear status. Please contact an operator before requesting another drip.".to_owned(),
+        ClaimResult::NeedsReconciliation => "A payout needs operator review. The faucet is temporarily unavailable.".to_owned(),
         ClaimResult::InProgress => "Your previous payout is still processing. Please wait for its result before requesting another drip.".to_owned(),
         ClaimResult::Cooldown(seconds) => {
             format!("Next claim available in {}.", human_duration(seconds))
@@ -143,11 +183,14 @@ fn claim_response(result: ClaimResult) -> String {
         ClaimResult::NotReady => {
             "The faucet is temporarily unavailable. Try again shortly.".to_owned()
         }
+        ClaimResult::RecordingFailed { txid } => format!(
+            "The payout was broadcast, but its local record needs operator review. Transaction: `{txid}`. Please contact an operator."
+        ),
         ClaimResult::Paid {
             txid,
             amount_zatoshis,
         } => format!(
-            "Sent {} TAZ. Transaction: `{txid}`. It may take a little while to confirm.",
+            "Sent {} TAZ. [View transaction](https://testnet.zecblock.com/tx/{txid}). It may take a little while to confirm.",
             format_taz(amount_zatoshis)
         ),
         ClaimResult::Rejected => "The wallet declined this payout, and your claim was not used. Check the address and try again; contact an operator if it continues.".to_owned(),
@@ -245,16 +288,23 @@ pub async fn run() -> Result<()> {
     let db = Database::open(&database_path)?;
     db.recover_on_startup()?;
     let wallet = Arc::new(FaucetWallet::open(&network).await?);
+    let payout = Arc::new(PayoutService::new(
+        daily_payout_cap_zatoshis,
+        db.clone(),
+        wallet.clone(),
+    ));
+    let shutdown = CancellationToken::new();
     let handler = Handler {
         guild_id,
         channel_id,
-        payout: PayoutService::new(daily_payout_cap_zatoshis, db.clone(), wallet.clone()),
+        payout: payout.clone(),
+        shutdown: shutdown.clone(),
+        registering: AtomicBool::new(false),
     };
 
     info!(
         guild_id,
-        channel_id,
-        "Discord faucet bot starting; payout enablement requires local operator resume after readiness checks"
+        channel_id, "Discord faucet bot starting; every payout is gated by wallet readiness"
     );
 
     let client = Client::builder(&discord_token, GatewayIntents::GUILDS)
@@ -277,24 +327,20 @@ pub async fn run() -> Result<()> {
             match signal {
                 Ok(()) => {
                     info!("shutdown signal received");
-                    shard_manager.shutdown_all().await;
                     Ok(())
                 }
                 Err(error) => Err(error),
             }
         },
     };
-    let shutdown_db = db.clone();
-    match tokio::task::spawn_blocking(move || shutdown_db.set_paused(true)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => error!(%err, "could not pause payouts during shutdown"),
-        Err(err) => error!(%err, "shutdown database worker failed"),
-    }
+    shutdown.cancel();
+    payout.drain().await;
+    shard_manager.shutdown_all().await;
     wallet.shutdown().await;
     result
 }
 
-async fn shutdown_signal() -> Result<()> {
+pub(crate) async fn shutdown_signal() -> Result<()> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};

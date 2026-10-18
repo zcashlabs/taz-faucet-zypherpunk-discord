@@ -16,7 +16,6 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 // A stale in-flight claim may have reached the network, so only an operator can resolve it.
 const STALE_SUBMISSION_MILLIS: i64 = 10 * 60 * 1_000;
-const COMPLETED_CLAIM_RETENTION_MILLIS: i64 = 90 * 24 * 60 * 60 * 1_000;
 
 #[derive(Clone)]
 pub struct Database(Arc<DatabaseInner>);
@@ -51,7 +50,8 @@ pub enum PayoutOutcome {
 
 pub enum Reconciliation {
     Paid(String),
-    Unpaid,
+    Expired,
+    OverrideUnpaid(String),
 }
 
 pub struct UnresolvedClaim {
@@ -59,6 +59,8 @@ pub struct UnresolvedClaim {
     pub destination: String,
     pub created_at: i64,
     pub amount_zatoshis: i64,
+    pub txid: Option<String>,
+    pub expiry_height: Option<u32>,
 }
 
 pub struct UnresolvedClaimSummary {
@@ -135,16 +137,19 @@ impl Database {
         match mode {
             OpenMode::Bot => {
                 anyhow::ensure!(
-                    schema_version <= 1,
+                    schema_version <= 2,
                     "database schema is newer than this bot"
                 );
                 if schema_version < 1 {
                     tx.execute_batch(include_str!("../migrations/0001_initial.sql"))?;
-                    tx.pragma_update(None, "user_version", 1)?;
+                }
+                if schema_version < 2 {
+                    tx.execute_batch(include_str!("../migrations/0002_recovery.sql"))?;
+                    tx.pragma_update(None, "user_version", 2)?;
                 }
             }
             OpenMode::Operator => anyhow::ensure!(
-                schema_version == 1,
+                schema_version == 2,
                 "database schema does not match this operator; start the matching bot to migrate it"
             ),
         }
@@ -238,6 +243,16 @@ impl Database {
             );
         }
 
+        // An ambiguous transmit may have released inputs inside the wallet. Stop all further sends.
+        let unknown: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM claims WHERE status = 'unknown')",
+            [],
+            |row| row.get(0),
+        )?;
+        if unknown {
+            return Ok(ClaimDecision::NeedsReconciliation);
+        }
+
         let previous_success: Option<i64> = tx.query_row(
             "SELECT updated_at FROM claims WHERE user_id = ?1 AND status = 'succeeded' ORDER BY updated_at DESC LIMIT 1",
             [user_id],
@@ -315,26 +330,39 @@ impl Database {
         };
         let conn = self.connection()?;
         let changed = conn.execute(
-            "UPDATE claims SET status = ?1, txid = ?2, destination = CASE WHEN ?1 = 'unknown' THEN destination ELSE NULL END, updated_at = ?3 WHERE id = ?4 AND status = 'submitting'",
+            "UPDATE claims SET status = ?1, txid = COALESCE(?2, txid), destination = CASE WHEN ?1 = 'unknown' THEN destination ELSE NULL END, updated_at = ?3 WHERE id = ?4 AND status = 'submitting' AND (?2 IS NULL OR txid IS NULL OR txid = ?2)",
             params![status, txid, now, id],
         )?;
         anyhow::ensure!(changed == 1, "claim {} was not in submitting state", id);
         Ok(())
     }
 
+    // The signed wallet transaction and this journal must both be durable before broadcasting.
+    pub fn record_transaction(&self, id: i64, txid: String, expiry_height: u32) -> Result<()> {
+        let txid = normalize_txid(txid)?;
+        anyhow::ensure!(expiry_height > 0, "transaction must have an expiry height");
+        let conn = self.connection()?;
+        let changed = conn.execute(
+            "UPDATE claims SET txid = ?1, expiry_height = ?2
+             WHERE id = ?3 AND status = 'submitting' AND txid IS NULL",
+            params![txid, expiry_height, id],
+        )?;
+        anyhow::ensure!(changed == 1, "claim is not an unprepared submission");
+        Ok(())
+    }
+
     pub fn recover_on_startup(&self) -> Result<()> {
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = tx.execute("UPDATE settings SET value = '1' WHERE name = 'paused'", [])?;
-        anyhow::ensure!(changed == 1, "persistent pause setting is missing");
         tx.execute(
             "UPDATE claims SET status = 'unknown', updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER) WHERE status = 'submitting'",
             [],
         ).context("could not mark interrupted payouts for reconciliation")?;
         tx.execute(
-            "DELETE FROM claims WHERE status IN ('succeeded', 'failed') AND updated_at < CAST(unixepoch('subsec') * 1000 AS INTEGER) - ?1",
-            [COMPLETED_CLAIM_RETENTION_MILLIS],
-        ).context("could not prune old completed claims")?;
+            "UPDATE settings SET value = '1' WHERE name = 'paused'
+             AND EXISTS (SELECT 1 FROM claims WHERE status = 'unknown')",
+            [],
+        )?;
         tx.commit()
             .context("could not commit startup claim recovery")
     }
@@ -400,12 +428,11 @@ impl Database {
         let conn = self.connection()?;
         let mut statement = conn.prepare(
             "SELECT id, user_id, status, created_at, amount_zatoshis FROM claims
-             WHERE (status = 'unknown'
-                OR (status = 'submitting' AND updated_at <= CAST(unixepoch('subsec') * 1000 AS INTEGER) - ?1))
-             AND (?2 IS NULL OR id < ?2)
+             WHERE status IN ('unknown', 'submitting')
+             AND (?1 IS NULL OR id < ?1)
              ORDER BY id DESC LIMIT 10",
         )?;
-        let rows = statement.query_map(params![STALE_SUBMISSION_MILLIS, before_id], |row| {
+        let rows = statement.query_map([before_id], |row| {
             Ok(UnresolvedClaimSummary {
                 id: row.get(0)?,
                 user_id: row.get(1)?,
@@ -422,9 +449,8 @@ impl Database {
         let conn = self.connection()?;
         conn.query_row(
             "SELECT COUNT(*) FROM claims
-             WHERE status = 'unknown'
-                OR (status = 'submitting' AND updated_at <= CAST(unixepoch('subsec') * 1000 AS INTEGER) - ?1)",
-            [STALE_SUBMISSION_MILLIS],
+             WHERE status IN ('unknown', 'submitting')",
+            [],
             |row| row.get(0),
         )
         .context("could not count unresolved claims")
@@ -433,37 +459,65 @@ impl Database {
     pub fn unresolved_claim(&self, id: i64) -> Result<Option<UnresolvedClaim>> {
         let conn = self.connection()?;
         conn.query_row(
-            "SELECT user_id, COALESCE(destination, ''), created_at, amount_zatoshis FROM claims
-             WHERE id = ?1 AND (status = 'unknown'
-                OR (status = 'submitting' AND updated_at <= CAST(unixepoch('subsec') * 1000 AS INTEGER) - ?2))",
-            params![id, STALE_SUBMISSION_MILLIS],
+            "SELECT user_id, COALESCE(destination, ''), created_at, amount_zatoshis, txid, expiry_height FROM claims
+             WHERE id = ?1 AND status IN ('unknown', 'submitting')",
+            [id],
             |row| {
                 Ok(UnresolvedClaim {
                     user_id: row.get(0)?,
                     destination: row.get(1)?,
                     created_at: row.get(2)?,
                     amount_zatoshis: row.get(3)?,
+                    txid: row.get(4)?,
+                    expiry_height: row.get(5)?,
                 })
             },
         ).optional().context("could not read unresolved claim")
     }
 
     pub fn reconcile(&self, id: i64, reconciliation: Reconciliation, now: i64) -> Result<()> {
-        let (status, txid) = match reconciliation {
+        let requires_journal = matches!(&reconciliation, Reconciliation::Expired);
+        let is_override = matches!(&reconciliation, Reconciliation::OverrideUnpaid(_));
+        let (status, txid, resolution) = match reconciliation {
             Reconciliation::Paid(txid) => {
                 let txid = normalize_txid(txid)?;
-                ("succeeded", Some(txid))
+                (
+                    "succeeded",
+                    Some(txid),
+                    "verified confirmed transaction".to_owned(),
+                )
             }
-            Reconciliation::Unpaid => ("failed", None),
+            Reconciliation::Expired => (
+                "failed",
+                None,
+                "verified expired transaction after complete wallet scan".to_owned(),
+            ),
+            Reconciliation::OverrideUnpaid(reason) => {
+                anyhow::ensure!(
+                    !reason.trim().is_empty() && reason.len() <= 512,
+                    "override requires a reason of 1–512 bytes"
+                );
+                (
+                    "failed",
+                    None,
+                    format!("UNVERIFIED OPERATOR OVERRIDE: {reason}"),
+                )
+            }
         };
         let conn = self.connection()?;
         let changed = conn.execute(
-            "UPDATE claims SET status = ?1, txid = ?2, destination = NULL, updated_at = ?3
-             WHERE id = ?4 AND (status = 'unknown'
-                OR (status = 'submitting' AND updated_at <= ?3 - ?5))",
-            params![status, txid, now, id, STALE_SUBMISSION_MILLIS],
+            "UPDATE claims SET status = ?1, txid = COALESCE(?2, txid), destination = NULL, updated_at = ?3, resolution = ?5
+             WHERE id = ?4 AND status IN ('unknown', 'submitting')
+                AND (?2 IS NULL OR txid IS NULL OR txid = ?2)
+                AND (SELECT value FROM settings WHERE name = 'paused') = '1'
+                AND (?6 = 0 OR (txid IS NOT NULL AND expiry_height IS NOT NULL))
+                AND (?7 = 0 OR txid IS NULL)",
+            params![status, txid, now, id, resolution, requires_journal, is_override],
         )?;
-        anyhow::ensure!(changed == 1, "claim does not exist or is not unresolved");
+        anyhow::ensure!(
+            changed == 1,
+            "pause payouts first; claim must be unresolved and its transaction ID must match"
+        );
         Ok(())
     }
 }
@@ -748,9 +802,16 @@ mod tests {
         assert_eq!(
             db.reserve("second", "recipient", now + 2, 86_400_000, cap)
                 .unwrap(),
-            ClaimDecision::DailyLimitReached(None)
+            ClaimDecision::NeedsReconciliation
         );
-        db.reconcile(id, Reconciliation::Unpaid, now + 3).unwrap();
+        db.set_paused(true).unwrap();
+        db.reconcile(
+            id,
+            Reconciliation::OverrideUnpaid("test override".to_owned()),
+            now + 3,
+        )
+        .unwrap();
+        db.set_paused(false).unwrap();
         assert!(matches!(
             db.reserve("second", "recipient", now + 4, 86_400_000, cap)
                 .unwrap(),
@@ -835,8 +896,10 @@ mod tests {
             ClaimDecision::NeedsReconciliation
         ));
         let txid = "b".repeat(64);
+        db.set_paused(true).unwrap();
         db.reconcile(id, Reconciliation::Paid(txid), now + 3)
             .unwrap();
+        db.set_paused(false).unwrap();
         assert!(matches!(
             db.reserve(
                 "user",
@@ -908,12 +971,12 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovery_pauses_and_prunes_by_completion_time() {
+    fn startup_recovery_preserves_enabled_state_and_all_payment_history() {
         let path = path();
         let db = Database::open(&path).unwrap();
         db.set_paused(false).unwrap();
         let now = chrono::Utc::now().timestamp_millis();
-        let old = now - COMPLETED_CLAIM_RETENTION_MILLIS - 1_000;
+        let old = now - 100 * 24 * 60 * 60 * 1_000;
 
         let ClaimDecision::Reserved { id: retained, .. } = db
             .reserve(
@@ -930,7 +993,9 @@ mod tests {
         db.finish(retained, PayoutOutcome::Paid("a".repeat(64)), now)
             .unwrap();
 
-        let ClaimDecision::Reserved { id: pruned, .. } = db
+        let ClaimDecision::Reserved {
+            id: old_failure, ..
+        } = db
             .reserve(
                 "long-completed",
                 "recipient",
@@ -942,10 +1007,10 @@ mod tests {
         else {
             panic!("claim should reserve")
         };
-        db.finish(pruned, PayoutOutcome::Failed, old).unwrap();
+        db.finish(old_failure, PayoutOutcome::Failed, old).unwrap();
 
         db.recover_on_startup().unwrap();
-        assert!(db.paused().unwrap());
+        assert!(!db.paused().unwrap());
         let conn = db.0.connection.lock().unwrap();
         let retained_count: i64 = conn
             .query_row(
@@ -954,15 +1019,15 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let pruned_count: i64 = conn
+        let old_failure_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM claims WHERE id = ?1",
-                [pruned],
+                [old_failure],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(retained_count, 1);
-        assert_eq!(pruned_count, 0);
+        assert_eq!(old_failure_count, 1);
         drop(conn);
         drop(db);
         cleanup(&path);
@@ -982,10 +1047,12 @@ mod tests {
             else {
                 panic!("claim should reserve")
             };
-            db.finish(id, PayoutOutcome::Unknown, now + 1).unwrap();
             ids.push(id);
         }
-
+        for id in &ids {
+            db.finish(*id, PayoutOutcome::Unknown, now + 1).unwrap();
+        }
+        db.set_paused(true).unwrap();
         let uppercase_txid = "A".repeat(64);
         db.reconcile(ids[0], Reconciliation::Paid(uppercase_txid), now + 2)
             .unwrap();
@@ -1069,7 +1136,7 @@ mod tests {
                 .unwrap()
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
         assert_eq!(
             db.payout_amount_zatoshis().unwrap(),
             DEFAULT_PAYOUT_ZATOSHIS
@@ -1077,5 +1144,133 @@ mod tests {
         assert!(Database::open_operator(&path).is_ok());
         drop(db);
         cleanup(&path);
+    }
+    #[test]
+    fn migration_preserves_existing_claims_pause_and_amount() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(include_str!("../migrations/0001_initial.sql"))
+            .unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute("UPDATE settings SET value = '0' WHERE name = 'paused'", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE settings SET value = '100000' WHERE name = 'payout_amount_zatoshis'",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO claims (user_id, destination, status, created_at, updated_at, amount_zatoshis) VALUES ('user', 'recipient', 'unknown', 1, 1, 100000)", []).unwrap();
+        drop(conn);
+        let db = Database::open(&path).unwrap();
+        assert!(!db.paused().unwrap());
+        assert_eq!(db.payout_amount_zatoshis().unwrap(), 100000);
+        let claim = db.unresolved_claim(1).unwrap().unwrap();
+        assert_eq!(claim.destination, "recipient");
+        assert_eq!(claim.txid, None);
+        assert_eq!(claim.expiry_height, None);
+        db.recover_on_startup().unwrap();
+        assert!(db.paused().unwrap());
+    }
+
+    #[test]
+    fn recovery_preserves_manual_pause_and_journaled_interrupted_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::open(&directory.path().join("claims.sqlite")).unwrap();
+        db.recover_on_startup().unwrap();
+        assert!(db.paused().unwrap());
+        db.set_paused(false).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let ClaimDecision::Reserved { id, .. } = db
+            .reserve("user", "recipient", now, 86_400_000, MAX_AMOUNT_ZATOSHIS)
+            .unwrap()
+        else {
+            panic!("reserve failed")
+        };
+        db.record_transaction(id, "A".repeat(64), 4_500_100)
+            .unwrap();
+        db.recover_on_startup().unwrap();
+        assert!(db.paused().unwrap());
+        let claim = db.unresolved_claim(id).unwrap().unwrap();
+        assert_eq!(claim.txid, Some("a".repeat(64)));
+        assert_eq!(claim.expiry_height, Some(4_500_100));
+        assert_eq!(claim.destination, "recipient");
+    }
+
+    #[test]
+    fn reconciliation_requires_pause_matching_txid_and_journal_for_expiry() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::open(&directory.path().join("claims.sqlite")).unwrap();
+        db.set_paused(false).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let ClaimDecision::Reserved { id, .. } = db
+            .reserve("user", "recipient", now, 86_400_000, MAX_AMOUNT_ZATOSHIS)
+            .unwrap()
+        else {
+            panic!("reserve failed")
+        };
+        db.record_transaction(id, "a".repeat(64), 4_500_100)
+            .unwrap();
+        db.finish(id, PayoutOutcome::Unknown, now).unwrap();
+        assert!(db.reconcile(id, Reconciliation::Expired, now).is_err());
+        db.set_paused(true).unwrap();
+        assert!(
+            db.reconcile(id, Reconciliation::Paid("b".repeat(64)), now)
+                .is_err()
+        );
+        assert!(
+            db.reconcile(id, Reconciliation::OverrideUnpaid("override".into()), now)
+                .is_err()
+        );
+        db.reconcile(id, Reconciliation::Expired, now).unwrap();
+        let (txid, resolution): (String, String) = db
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT txid, resolution FROM claims WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(txid, "a".repeat(64));
+        assert!(resolution.contains("verified expired"));
+    }
+
+    #[test]
+    fn legacy_override_requires_reason_and_is_recorded_as_unverified() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::open(&directory.path().join("claims.sqlite")).unwrap();
+        db.set_paused(false).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let ClaimDecision::Reserved { id, .. } = db
+            .reserve("user", "recipient", now, 86_400_000, MAX_AMOUNT_ZATOSHIS)
+            .unwrap()
+        else {
+            panic!("reserve failed")
+        };
+        db.finish(id, PayoutOutcome::Unknown, now).unwrap();
+        db.set_paused(true).unwrap();
+        assert!(db.reconcile(id, Reconciliation::Expired, now).is_err());
+        assert!(
+            db.reconcile(id, Reconciliation::OverrideUnpaid(" ".into()), now)
+                .is_err()
+        );
+        db.reconcile(
+            id,
+            Reconciliation::OverrideUnpaid("external investigation completed".into()),
+            now,
+        )
+        .unwrap();
+        let resolution: String = db
+            .connection()
+            .unwrap()
+            .query_row("SELECT resolution FROM claims WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            resolution,
+            "UNVERIFIED OPERATOR OVERRIDE: external investigation completed"
+        );
     }
 }

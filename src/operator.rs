@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 
-const USAGE: &str = "Usage:\n  taz-faucet-zypherpunk-discord operator wallet-init\n  taz-faucet-zypherpunk-discord operator status\n  taz-faucet-zypherpunk-discord operator pause\n  taz-faucet-zypherpunk-discord operator resume\n  taz-faucet-zypherpunk-discord operator set-amount <TAZ>\n  taz-faucet-zypherpunk-discord operator unresolved [before-claim-id]\n  taz-faucet-zypherpunk-discord operator inspect <claim-id>\n  taz-faucet-zypherpunk-discord operator reconcile <claim-id> paid <txid>\n  taz-faucet-zypherpunk-discord operator reconcile <claim-id> unpaid --confirm-unbroadcast-cleanup";
+const USAGE: &str = "Usage:\n  taz-faucet-zypherpunk-discord operator wallet-init\n  taz-faucet-zypherpunk-discord operator status\n  taz-faucet-zypherpunk-discord operator pause\n  taz-faucet-zypherpunk-discord operator resume\n  taz-faucet-zypherpunk-discord operator set-amount <TAZ>\n  taz-faucet-zypherpunk-discord operator unresolved [before-claim-id]\n  taz-faucet-zypherpunk-discord operator inspect <claim-id>\n  taz-faucet-zypherpunk-discord operator reconcile <claim-id> paid <txid>\n  taz-faucet-zypherpunk-discord operator reconcile <claim-id> unpaid\n  taz-faucet-zypherpunk-discord operator override-unpaid <claim-id> --accept-double-payment-risk <reason>";
 
 enum OperatorCommand {
     Status,
@@ -18,6 +18,7 @@ enum OperatorCommand {
     Inspect(i64),
     ReconcilePaid { claim_id: i64, txid: String },
     ReconcileUnpaid { claim_id: i64 },
+    OverrideUnpaid { claim_id: i64, reason: String },
 }
 
 pub async fn run(args: &[String]) -> Result<()> {
@@ -67,6 +68,10 @@ pub async fn run(args: &[String]) -> Result<()> {
             anyhow::ensure!(
                 amount <= daily_cap,
                 "payout amount exceeds the aggregate daily cap"
+            );
+            anyhow::ensure!(
+                db.unresolved_count()? == 0,
+                "reconcile unresolved claims before resuming"
             );
             wallet::check_configured(&network, amount)
                 .await
@@ -118,12 +123,39 @@ pub async fn run(args: &[String]) -> Result<()> {
             println!("Requested: {}", format_time(claim.created_at));
             println!("Payout amount: {} TAZ", format_taz(claim.amount_zatoshis));
             println!("Recipient: {}", claim.destination);
+            println!(
+                "Transaction ID: {}",
+                claim.txid.as_deref().unwrap_or("not recorded")
+            );
+            println!(
+                "Expiry height: {}",
+                claim
+                    .expiry_height
+                    .map_or_else(|| "not recorded".to_owned(), |height| height.to_string())
+            );
         }
         OperatorCommand::ReconcilePaid { claim_id, txid } => {
             let _control_lock = db.acquire_control_lock()?;
             let _payout_lock = db
                 .try_acquire_payout_lock()?
                 .context("a payout is active; retry reconciliation after it finishes")?;
+            anyhow::ensure!(db.paused()?, "pause payouts before reconciliation");
+            let claim = db
+                .unresolved_claim(claim_id)?
+                .context("claim is not unresolved")?;
+            if let Some(recorded) = &claim.txid {
+                anyhow::ensure!(
+                    recorded.eq_ignore_ascii_case(&txid),
+                    "transaction ID differs from the claim journal"
+                );
+            }
+            let txid = txid.to_ascii_lowercase();
+            let verified =
+                wallet::verify_payment(&config::NetworkConfig::from_env()?, &claim, &txid).await?;
+            anyhow::ensure!(
+                matches!(verified, wallet::VerifiedPayment::Confirmed),
+                "transaction is not a confirmed payment"
+            );
             db.reconcile(
                 claim_id,
                 Reconciliation::Paid(txid),
@@ -136,12 +168,50 @@ pub async fn run(args: &[String]) -> Result<()> {
             let _payout_lock = db
                 .try_acquire_payout_lock()?
                 .context("a payout is active; retry reconciliation after it finishes")?;
+            anyhow::ensure!(db.paused()?, "pause payouts before reconciliation");
+            let claim = db
+                .unresolved_claim(claim_id)?
+                .context("claim is not unresolved")?;
+            let txid = claim
+                .txid
+                .as_deref()
+                .context("no recorded transaction ID; nonpayment cannot be verified")?;
+            let verified =
+                wallet::verify_payment(&config::NetworkConfig::from_env()?, &claim, txid).await?;
+            anyhow::ensure!(
+                matches!(verified, wallet::VerifiedPayment::Expired),
+                "transaction paid the recipient; use paid reconciliation"
+            );
             db.reconcile(
                 claim_id,
-                Reconciliation::Unpaid,
+                Reconciliation::Expired,
                 chrono::Utc::now().timestamp_millis(),
             )?;
-            println!("Claim {claim_id} recorded as unpaid and released for retry.");
+            println!("Claim {claim_id} verified expired and released for retry.");
+        }
+        OperatorCommand::OverrideUnpaid { claim_id, reason } => {
+            let _control_lock = db.acquire_control_lock()?;
+            let _payout_lock = db
+                .try_acquire_payout_lock()?
+                .context("a payout is active; retry after it finishes")?;
+            anyhow::ensure!(db.paused()?, "pause payouts before reconciliation");
+            let claim = db
+                .unresolved_claim(claim_id)?
+                .context("claim is not unresolved")?;
+            anyhow::ensure!(
+                claim.txid.is_none(),
+                "a journaled transaction requires verified reconciliation"
+            );
+            let network = config::NetworkConfig::from_env()?;
+            let _wallet_lock = wallet::lock_configured(&network)?;
+            db.reconcile(
+                claim_id,
+                Reconciliation::OverrideUnpaid(reason),
+                chrono::Utc::now().timestamp_millis(),
+            )?;
+            println!(
+                "WARNING: Claim {claim_id} released by an UNVERIFIED override. Nonpayment was not established; a duplicate payment is possible. The reason has been recorded."
+            );
         }
     }
     Ok(())
@@ -166,13 +236,19 @@ fn parse_command(args: &[String]) -> Result<OperatorCommand> {
                 txid: args[3].clone(),
             }
         }
-        Some("reconcile")
-            if args.len() == 4
-                && args[2] == "unpaid"
-                && args[3] == "--confirm-unbroadcast-cleanup" =>
-        {
+        Some("reconcile") if args.len() == 3 && args[2] == "unpaid" => {
             OperatorCommand::ReconcileUnpaid {
                 claim_id: parse_id(&args[1])?,
+            }
+        }
+        Some("override-unpaid") if args.len() == 4 && args[2] == "--accept-double-payment-risk" => {
+            anyhow::ensure!(
+                !args[3].trim().is_empty() && args[3].len() <= 512,
+                "override requires a reason of 1–512 bytes"
+            );
+            OperatorCommand::OverrideUnpaid {
+                claim_id: parse_id(&args[1])?,
+                reason: args[3].clone(),
             }
         }
         _ => bail!("{USAGE}"),
@@ -211,18 +287,30 @@ mod tests {
     }
 
     #[test]
-    fn parser_requires_explicit_unpaid_reconciliation_confirmation() {
+    fn parser_separates_verified_reconciliation_from_risky_override() {
+        assert!(matches!(
+            parse_command(&args(&["reconcile", "12", "unpaid"])).unwrap(),
+            OperatorCommand::ReconcileUnpaid { claim_id: 12 }
+        ));
+        assert!(parse_command(&args(&["override-unpaid", "12"])).is_err());
         assert!(
             parse_command(&args(&[
-                "reconcile",
+                "override-unpaid",
                 "12",
-                "unpaid",
-                "--confirm-unbroadcast-cleanup"
+                "--accept-double-payment-risk",
+                ""
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_command(&args(&[
+                "override-unpaid",
+                "12",
+                "--accept-double-payment-risk",
+                "manually established nonpayment"
             ]))
             .is_ok()
         );
-        assert!(parse_command(&args(&["reconcile", "12", "unpaid"])).is_err());
-        assert!(parse_command(&args(&["reconcile", "12", "unpaid", "--confirm"])).is_err());
     }
 
     #[test]
