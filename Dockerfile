@@ -5,9 +5,9 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,target=/build/target,sharing=locked \
+RUN --mount=type=cache,id=s/e13bd738-a4e3-4255-b6b8-77ecffbbdbf4-/usr/local/cargo/registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=s/e13bd738-a4e3-4255-b6b8-77ecffbbdbf4-/usr/local/cargo/git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=s/e13bd738-a4e3-4255-b6b8-77ecffbbdbf4-/build/target,target=/build/target,sharing=locked \
     cargo build --release --locked \
     && strip target/release/taz-faucet-zypherpunk-discord \
     && cp target/release/taz-faucet-zypherpunk-discord /build/faucet
