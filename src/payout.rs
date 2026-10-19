@@ -16,7 +16,7 @@ use crate::{
     wallet::{FaucetWallet, PreparedPayment},
 };
 
-const COOLDOWN_MILLIS: i64 = 24 * 60 * 60 * 1_000;
+const COOLDOWN_MILLIS: i64 = 6 * 60 * 60 * 1_000;
 const QUEUE_WAIT: Duration = Duration::from_secs(15);
 
 // This seam isolates third-party wallet effects so failure and cancellation boundaries can be tested.
@@ -399,6 +399,39 @@ mod tests {
             ClaimResult::Cooldown(_)
         ));
         assert_eq!(fixture.wallet.broadcasts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn six_hour_cooldown_allows_a_new_reservation() {
+        let fixture = Fixture::new(None, Some(Stage::Readiness));
+        let completed_at = chrono::Utc::now().timestamp_millis() - 21_600_000;
+        let ClaimDecision::Reserved { id, .. } = fixture
+            .db
+            .reserve(
+                "1",
+                "recipient",
+                completed_at,
+                COOLDOWN_MILLIS,
+                1_000_000_000,
+            )
+            .unwrap()
+        else {
+            panic!("first claim should reserve")
+        };
+        fixture
+            .db
+            .finish(id, PayoutOutcome::Paid(TXID.to_owned()), completed_at)
+            .unwrap();
+
+        assert!(matches!(
+            fixture.service.claim(1, "recipient").await.unwrap(),
+            ClaimResult::NotReady
+        ));
+        let claims: i64 = fixture
+            .connection()
+            .query_row("SELECT COUNT(*) FROM claims", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(claims, 2);
     }
 
     #[tokio::test]

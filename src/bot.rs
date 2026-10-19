@@ -54,10 +54,11 @@ impl EventHandler for Handler {
         if command.guild_id.map(|id| id.get()) != Some(self.guild_id)
             || command.channel_id.get() != self.channel_id
         {
-            respond_ephemeral(
+            respond(
                 &command,
                 &ctx,
-                "Use `/drip` in the configured faucet channel.",
+                &format!("Use `/drip` in <#{}>.", self.channel_id),
+                true,
             )
             .await;
             return;
@@ -69,31 +70,20 @@ impl EventHandler for Handler {
             .and_then(|option| option.value.as_str())
             .map(str::trim)
         else {
-            respond_ephemeral(&command, &ctx, "Provide a Zcash testnet address.").await;
+            respond(&command, &ctx, "Provide a Zcash testnet address.", false).await;
             return;
         };
         let Some(address) = parse_testnet_address(address) else {
-            respond_ephemeral(
+            respond(
                 &command,
                 &ctx,
                 "Enter a valid Zcash testnet address: `utest1…`, `ztestsapling…`, `tm…`, or `t2…`.",
+                false,
             )
             .await;
             return;
         };
-        if let Err(err) = command
-            .create_response(
-                &ctx.http,
-                CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new()
-                        .content("Processing your request…")
-                        .allowed_mentions(no_mentions())
-                        .ephemeral(true),
-                ),
-            )
-            .await
-        {
-            warn!(%err, "could not acknowledge Discord interaction");
+        if !respond(&command, &ctx, "Processing your request…", false).await {
             return;
         }
 
@@ -190,7 +180,7 @@ fn claim_response(result: ClaimResult) -> String {
             txid,
             amount_zatoshis,
         } => format!(
-            "Sent {} TAZ. [View transaction](https://testnet.zecblock.com/tx/{txid}). It may take a little while to confirm.",
+            "Sent {} TAZ. It may take a little while to confirm.\n[View transaction →](https://testnet.zecblock.com/tx/{txid})",
             format_taz(amount_zatoshis)
         ),
         ClaimResult::Rejected => "The wallet declined this payout, and your claim was not used. Check the address and try again; contact an operator if it continues.".to_owned(),
@@ -200,7 +190,7 @@ fn claim_response(result: ClaimResult) -> String {
 
 fn drip_command() -> CreateCommand {
     CreateCommand::new("drip")
-        .description("Receive 0.1 TAZ once every 24 hours")
+        .description("Receive 0.1 TAZ once every 6 hours")
         .add_option(
             CreateCommandOption::new(
                 CommandOptionType::String,
@@ -212,25 +202,43 @@ fn drip_command() -> CreateCommand {
         )
 }
 
-async fn respond_ephemeral(
+fn response_message(
+    user_id: u64,
+    content: &str,
+    ephemeral: bool,
+) -> CreateInteractionResponseMessage {
+    let content = if ephemeral {
+        content.to_owned()
+    } else {
+        format!("<@{user_id}> {content}")
+    };
+    CreateInteractionResponseMessage::new()
+        .content(content)
+        .allowed_mentions(no_mentions())
+        .ephemeral(ephemeral)
+}
+
+async fn respond(
     command: &serenity::all::CommandInteraction,
     ctx: &Context,
     content: &str,
-) {
+    ephemeral: bool,
+) -> bool {
     if let Err(err) = command
         .create_response(
             &ctx.http,
-            CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content(content)
-                    .allowed_mentions(no_mentions())
-                    .ephemeral(true),
-            ),
+            CreateInteractionResponse::Message(response_message(
+                command.user.id.get(),
+                content,
+                ephemeral,
+            )),
         )
         .await
     {
         warn!(%err, "could not reply to Discord interaction");
+        return false;
     }
+    true
 }
 
 async fn finish_response(
@@ -242,7 +250,7 @@ async fn finish_response(
         .edit_response(
             &ctx.http,
             EditInteractionResponse::new()
-                .content(content)
+                .content(format!("<@{}> {content}", command.user.id))
                 .allowed_mentions(no_mentions()),
         )
         .await
@@ -357,4 +365,48 @@ pub(crate) async fn shutdown_signal() -> Result<()> {
         .await
         .context("could not install the Ctrl-C handler")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serenity::json::json;
+
+    #[test]
+    fn channel_responses_are_public_and_identify_the_requester_without_pinging() {
+        let response = json!(response_message(123, "Processing your request…", false));
+        assert_eq!(response["flags"], 0);
+        assert_eq!(response["content"], "<@123> Processing your request…");
+        assert_eq!(response["allowed_mentions"]["parse"], json!([]));
+    }
+
+    #[test]
+    fn redirects_outside_the_faucet_channel_are_private() {
+        let response = json!(response_message(123, "Use `/drip` in <#456>.", true));
+        assert_eq!(response["flags"], 64);
+        assert_eq!(response["content"], "Use `/drip` in <#456>.");
+        assert_eq!(response["allowed_mentions"]["parse"], json!([]));
+    }
+
+    #[test]
+    fn drip_description_matches_the_six_hour_cooldown() {
+        let command = json!(drip_command());
+        assert_eq!(command["description"], "Receive 0.1 TAZ once every 6 hours");
+    }
+
+    #[test]
+    fn success_keeps_the_confirmation_notice_inline_and_the_transaction_link_below() {
+        let txid = "a".repeat(64);
+        let response = claim_response(ClaimResult::Paid {
+            txid: txid.clone(),
+            amount_zatoshis: 10_000_000,
+        });
+        assert_eq!(
+            response.lines().collect::<Vec<_>>(),
+            [
+                "Sent 0.1 TAZ. It may take a little while to confirm.",
+                &format!("[View transaction →](https://testnet.zecblock.com/tx/{txid})"),
+            ]
+        );
+    }
 }

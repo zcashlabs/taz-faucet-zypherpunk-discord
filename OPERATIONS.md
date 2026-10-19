@@ -1,8 +1,8 @@
 # Running and recovering the faucet
 
-The Discord interface is `/drip address:<testnet-address>`, restricted to the configured guild and channel. Replies are ephemeral. Successful replies include a transaction link at `https://testnet.zecblock.com/tx/<txid>`; the explorer can take time to index a broadcast.
+The Discord interface is `/drip address:<testnet-address>`, restricted to the configured guild and channel. Replies in that channel are public and identify the requester without pinging them; attempts elsewhere receive a private redirect. Successful replies include a transaction link at `https://testnet.zecblock.com/tx/<txid>`; the explorer can take time to index a broadcast.
 
-Configuration comes from `.env` as shown in `.env.example`. The payout amount is persisted in SQLite, initially 0.1 TAZ. Each user has a rolling 24-hour cooldown from payout completion. `DAILY_PAYOUT_CAP_TAZ` caps aggregate payouts over a rolling 24 hours; unresolved claims continue consuming that budget.
+Configuration comes from `.env` as shown in `.env.example`. The payout amount is persisted in SQLite, initially 0.1 TAZ. Each user has a rolling 6-hour cooldown from payout completion. `DAILY_PAYOUT_CAP_TAZ` caps aggregate payouts over a rolling 24 hours; unresolved claims continue consuming that budget.
 
 ## Local commands
 

@@ -16,6 +16,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 // A stale in-flight claim may have reached the network, so only an operator can resolve it.
 const STALE_SUBMISSION_MILLIS: i64 = 10 * 60 * 1_000;
+const DAILY_WINDOW_MILLIS: i64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Clone)]
 pub struct Database(Arc<DatabaseInner>);
@@ -273,7 +274,7 @@ impl Database {
             "SELECT COALESCE(SUM(amount_zatoshis), 0) FROM claims
              WHERE status IN ('submitting', 'unknown')
                 OR (status = 'succeeded' AND updated_at > ?1)",
-            [now.saturating_sub(cooldown)],
+            [now.saturating_sub(DAILY_WINDOW_MILLIS)],
             |row| row.get(0),
         )?;
         if amount_zatoshis > daily_cap.saturating_sub(daily_spend) {
@@ -286,17 +287,19 @@ impl Database {
                      WHERE status = 'succeeded' AND updated_at > ?1
                      ORDER BY updated_at",
                 )?;
-                let rows = statement.query_map([now.saturating_sub(cooldown)], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-                })?;
+                let rows = statement
+                    .query_map([now.saturating_sub(DAILY_WINDOW_MILLIS)], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                    })?;
                 let mut released = 0_i64;
                 let mut retry_after = None;
                 for row in rows {
                     let (completed_at, amount) = row?;
                     released = released.saturating_add(amount);
                     if released >= release_needed {
-                        let remaining_millis =
-                            completed_at.saturating_add(cooldown).saturating_sub(now);
+                        let remaining_millis = completed_at
+                            .saturating_add(DAILY_WINDOW_MILLIS)
+                            .saturating_sub(now);
                         retry_after = Some(remaining_millis.saturating_add(999) / 1_000);
                         break;
                     }
@@ -606,7 +609,7 @@ mod tests {
         db.set_paused(false).unwrap();
         let now = 1_800_000_000_000;
         let ClaimDecision::Reserved { id: failed, .. } = db
-            .reserve("user", "address", now, 86_400_000, MAX_AMOUNT_ZATOSHIS)
+            .reserve("user", "address", now, 21_600_000, MAX_AMOUNT_ZATOSHIS)
             .unwrap()
         else {
             panic!("first claim should reserve")
@@ -614,7 +617,7 @@ mod tests {
         db.finish(failed, PayoutOutcome::Failed, now + 1).unwrap();
 
         let ClaimDecision::Reserved { id: paid, .. } = db
-            .reserve("user", "address", now + 2, 86_400_000, MAX_AMOUNT_ZATOSHIS)
+            .reserve("user", "address", now + 2, 21_600_000, MAX_AMOUNT_ZATOSHIS)
             .unwrap()
         else {
             panic!("a rejected payout must not consume the cooldown")
@@ -638,8 +641,8 @@ mod tests {
             db.reserve(
                 "user",
                 "address",
-                completed_at + 86_400_000 - 1,
-                86_400_000,
+                completed_at + 21_600_000 - 1,
+                21_600_000,
                 MAX_AMOUNT_ZATOSHIS
             )
             .unwrap(),
@@ -649,8 +652,8 @@ mod tests {
             db.reserve(
                 "user",
                 "address",
-                completed_at + 86_400_000,
-                86_400_000,
+                completed_at + 21_600_000,
+                21_600_000,
                 MAX_AMOUNT_ZATOSHIS
             )
             .unwrap(),
@@ -695,7 +698,7 @@ mod tests {
         let db = Database::open(&path).unwrap();
         db.set_paused(false).unwrap();
         let now = 1_800_000_000_000;
-        let cooldown = 86_400_000;
+        let cooldown = 21_600_000;
         let ClaimDecision::Reserved { id, .. } = db
             .reserve("first", "recipient", now, cooldown, DEFAULT_PAYOUT_ZATOSHIS)
             .unwrap()
@@ -717,11 +720,22 @@ mod tests {
             .unwrap(),
             ClaimDecision::DailyLimitReached(Some(86_399))
         );
+        assert_eq!(
+            db.reserve(
+                "first",
+                "recipient",
+                completed_at + cooldown,
+                cooldown,
+                DEFAULT_PAYOUT_ZATOSHIS,
+            )
+            .unwrap(),
+            ClaimDecision::DailyLimitReached(Some(64_800))
+        );
         assert!(matches!(
             db.reserve(
                 "second",
                 "recipient",
-                completed_at + cooldown,
+                completed_at + DAILY_WINDOW_MILLIS,
                 cooldown,
                 DEFAULT_PAYOUT_ZATOSHIS
             )
@@ -1120,7 +1134,15 @@ mod tests {
         let payout_guard = db.try_acquire_payout_lock().unwrap().unwrap();
         assert!(db.try_acquire_payout_lock().unwrap().is_none());
         drop(payout_guard);
-        assert!(db.try_acquire_payout_lock().unwrap().is_some());
+        // Parallel subprocess tests can inherit the lock until exec closes the descriptor.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while db.try_acquire_payout_lock().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "payout lock stayed held"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         drop(db);
         cleanup(&path);
     }
