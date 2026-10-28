@@ -2115,6 +2115,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "portpicker"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be97d76faf1bfab666e1375477b23fde79eccf0276e9b63b92a39d676a889ba9"
+dependencies = [
+ "rand 0.8.8",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2181,6 +2190,8 @@ dependencies = [
  "prettyplease",
  "prost",
  "prost-types",
+ "pulldown-cmark",
+ "pulldown-cmark-to-cmark",
  "regex",
  "syn 2.0.119",
  "tempfile",
@@ -2206,6 +2217,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
 dependencies = [
  "prost",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "278e9268c93b9e498a2da46c34d90ba93a3255eb99009646398f34bc73ab36eb"
+dependencies = [
+ "bitflags",
+ "memchr",
+ "unicase",
+]
+
+[[package]]
+name = "pulldown-cmark-to-cmark"
+version = "22.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84bbb29c624230c4bd1047bbdb2aa47e41c860e9665ce62ba9504eebe91bf867"
+dependencies = [
+ "pulldown-cmark",
 ]
 
 [[package]]
@@ -2994,6 +3025,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "tonic",
  "tracing",
  "tracing-subscriber",
  "zcash_client_backend",
@@ -3862,6 +3894,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "zaino-proto"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "120e9bb92547921333d63d8dc96ca7489694d5a87dc6e805152468bdd435646b"
+dependencies = [
+ "prost",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
 name = "zcash_address"
 version = "0.14.0-pre.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4265,6 +4309,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "zingo_test_vectors"
+version = "0.0.1"
+source = "git+https://github.com/zingolabs/infrastructure.git?rev=89cf104a2416144d1bbbae30aca02bec062d1492#89cf104a2416144d1bbbae30aca02bec062d1492"
+
+[[package]]
 name = "zingolib"
 version = "6.0.0"
 source = "git+https://github.com/zingolabs/zingolib.git?rev=62d42596eec0951ac14daa0e712318263c5e8820#62d42596eec0951ac14daa0e712318263c5e8820"
@@ -4289,6 +4338,7 @@ dependencies = [
  "nonempty",
  "orchard",
  "pepper-sync",
+ "portpicker",
  "prost",
  "rand 0.10.3",
  "sapling-crypto",
@@ -4297,9 +4347,12 @@ dependencies = [
  "serde",
  "sha2 0.10.9",
  "shardtree",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-stream",
  "tracing",
+ "zaino-proto",
  "zcash_address",
  "zcash_client_backend",
  "zcash_encoding",
@@ -4315,6 +4368,7 @@ dependencies = [
  "zingo-price",
  "zingo-status",
  "zingo_common_components",
+ "zingo_test_vectors",
  "zip32",
 ]
 

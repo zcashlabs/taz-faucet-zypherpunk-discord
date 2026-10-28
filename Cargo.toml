@@ -26,6 +26,8 @@ zip32 = "0.3"
 [dev-dependencies]
 tempfile = "3"
 zcash_keys = "=0.17.0-pre.1"
+tonic = "0.14"
+zingolib = { git = "https://github.com/zingolabs/zingolib.git", rev = "62d42596eec0951ac14daa0e712318263c5e8820", features = ["testutils"] }
 
 [profile.release]
 lto = true

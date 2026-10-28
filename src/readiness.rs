@@ -23,9 +23,6 @@ impl std::error::Error for InsufficientFunds {}
 
 pub async fn check(client: &mut LightClient, amount_zatoshis: i64) -> Result<()> {
     check_wallet(client, amount_zatoshis).await?;
-    if let Some((_, error)) = client.poll_sync_recovery() {
-        anyhow::bail!("light-wallet sync failed: {error}");
-    }
     anyhow::ensure!(
         client
             .latest_sync_status()

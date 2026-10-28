@@ -17,6 +17,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -331,6 +332,7 @@ pub async fn run() -> Result<()> {
     let shard_manager = client.shard_manager.clone();
     let result = tokio::select! {
         result = client.start() => result.context("Discord client stopped with an error"),
+        _ = monitor_sync(wallet.clone()) => unreachable!("wallet sync monitor exited"),
         signal = shutdown_signal() => {
             match signal {
                 Ok(()) => {
@@ -346,6 +348,17 @@ pub async fn run() -> Result<()> {
     shard_manager.shutdown_all().await;
     wallet.shutdown().await;
     result
+}
+
+async fn monitor_sync(wallet: Arc<FaucetWallet>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        if let Err(error) = wallet.maintain_sync().await {
+            warn!(%error, "light-wallet sync restart failed");
+        }
+    }
 }
 
 pub(crate) async fn shutdown_signal() -> Result<()> {

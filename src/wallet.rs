@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use tokio::sync::Mutex;
-use tracing::error;
+use tracing::{error, info, warn};
 use zcash_client_backend::zip321::{Payment, TransactionRequest};
 use zingolib::{
     config::{ChainType, ClientConfig, WalletConfig},
@@ -139,7 +139,13 @@ impl FaucetWallet {
             .check_save_error()
             .await
             .context("light-wallet background save failed")?;
+        ensure_sync_running(&mut client).await?;
         readiness::check(&mut client, amount_zatoshis).await
+    }
+
+    pub async fn maintain_sync(&self) -> Result<()> {
+        let mut client = self.client.lock().await;
+        ensure_sync_running(&mut client).await
     }
 
     pub async fn shutdown(&self) {
@@ -153,6 +159,20 @@ impl FaucetWallet {
             error!(%err, "final wallet save failed during shutdown");
         }
     }
+}
+
+async fn ensure_sync_running(client: &mut LightClient) -> Result<()> {
+    if let Some((_, error)) = client.poll_sync_recovery() {
+        warn!(%error, "light-wallet sync failed; restarting");
+    }
+    if client.sync_mode() == zingolib::sync::SyncMode::NotRunning {
+        client
+            .sync()
+            .await
+            .context("could not restart light-wallet sync")?;
+        info!("light-wallet sync restarted");
+    }
+    Ok(())
 }
 
 pub async fn check_configured(network: &NetworkConfig, amount_zatoshis: i64) -> Result<()> {
@@ -548,6 +568,70 @@ mod tests {
         assert!(lock_configured(&network).is_err());
         drop(lock);
         assert!(lock_configured(&network).is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_continuous_sync_is_restarted() {
+        use tonic::Code;
+        use zingolib::{
+            data::PollReport,
+            testutils::mock_indexer::{Fault, MockNet, Rpc},
+        };
+
+        let mut net = MockNet::launch().await;
+        net.chain.write().await.mine_empty_blocks(2);
+        let mut client = net
+            .client(
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art",
+                None,
+            )
+            .await;
+        let mut settings = client.wallet().read().await.wallet_settings.clone();
+        settings.sync_config.shutdown_on_completion = false;
+        client.update_wallet_settings(settings).await;
+        client.sync().await.unwrap();
+
+        let mut progress = client.subscribe_sync_status();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while progress
+                .borrow()
+                .as_ref()
+                .is_none_or(|status| !status.is_complete())
+            {
+                progress.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("initial scan completes");
+
+        net.chain.write().await.faults.inject(
+            Rpc::LatestBlock,
+            Fault::Fail(Code::Unavailable, "mock outage".to_owned()),
+        );
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while progress.changed().await.is_ok() {}
+        })
+        .await
+        .expect("failed sync session exits");
+
+        net.chain.write().await.mine_empty_blocks(101);
+        ensure_sync_running(&mut client).await.unwrap();
+        assert!(matches!(client.poll_sync(), PollReport::NotReady));
+        let mut progress = client.subscribe_sync_status();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while client
+                .wallet()
+                .read()
+                .await
+                .sync_state
+                .fully_scanned_height()
+                .is_none_or(|height| u32::from(height) < 103)
+            {
+                progress.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("restarted session catches up after falling over 100 blocks behind");
     }
     #[tokio::test]
     #[ignore = "requires a funded testnet wallet snapshot and network access; never broadcasts"]
